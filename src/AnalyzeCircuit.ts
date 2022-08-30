@@ -1,4 +1,6 @@
 import { CircuitElm } from "./CircuitElm";
+import { CircuitNode, CircuitNodeLink } from "./CircuitNode";
+import { DetectType, FindPathInfo } from "./FindPathInfo";
 import { GroundElm } from "./GroundElm";
 import { Point } from "./Point";
 import { RailElm } from "./RailElm";
@@ -7,10 +9,7 @@ import { VoltageElm } from "./VoltageElm";
 import { WireElm } from "./WireElm";
 
 
-interface CircuitNodeLink {
-    num: number;
-    elm: CircuitElm;
-}
+
 interface NodeMapEntry {
     node: number; // should be -1 by default
 }
@@ -18,14 +17,6 @@ function createNodeMapEntry(node = -1): NodeMapEntry {
     return {
         node: node
     };
-}
-
-class CircuitNode {
-    links: Array<CircuitNodeLink>;
-    internal = false;
-    constructor() {
-        this.links = [];
-    }
 }
 interface WireInfo {
     wire: CircuitElm;
@@ -67,10 +58,37 @@ function analyzeCircuit(elmList: Array<CircuitElm>) {
         console.log(v, k);
     });
     setGroundNode(nodeList, elmList, nodeMap);
+    /** 所有电源的数量,包扩内部电源 */
+    const voltageSourceCount = makeNodeList(nodeList, elmList, nodeMap);
 
-    const vscount = makeNodeList(nodeList, elmList, nodeMap);
-    // let voltageSources = Array<CircuitElm>(vscount); 
-    // console.log(vscount)
+    const voltageSources: CircuitElm[] = [];
+    const isvalid = calcWireInfo(wireInfoList, nodeList);
+    if (!isvalid)
+        return;
+    wireInfoList.forEach((wire, idx) => {
+        console.log(`${idx}: ${wire.wire}`);
+    });
+    let circuitNonLinear = false;
+    for (let i = 0; i < elmList.length; i++) {
+        const ce = elmList[i];
+        if (ce.nonLinear) {
+            circuitNonLinear = true;
+        }
+        const ivs = ce.getVoltageSourceCount();
+        for (let j = 0; j < ivs; j++) {
+            ce.setVoltageSource(j, voltageSources.length);
+            voltageSources.push(ce);
+        }
+    }
+    // TODO: showResistanceInVoltageSources
+
+    const { nodesWithGroundConnection, unconnectedNodes } = findUnconnectedNodes(nodeList); //verify
+
+    if (!validateCircuit(elmList, nodeList, nodesWithGroundConnection)) { // verify
+        return;
+    }
+    const nodesWithGroundConnectionCount = nodesWithGroundConnection.length;
+    // stamp
 }
 
 /**
@@ -214,6 +232,12 @@ function makeNodeList(nodeList: Array<CircuitNode>, elmList: Array<CircuitElm>, 
     return vscount;
 }
 
+/**
+ * 
+ * @param wireInfoList 
+ * @param nodeList 
+ * @returns wire loop is valid or not
+ */
 function calcWireInfo(wireInfoList: Array<WireInfo>, nodeList: Array<CircuitNode>) {
     let moved = 0;
     const loopList = [...wireInfoList];
@@ -243,7 +267,7 @@ function calcWireInfo(wireInfoList: Array<WireInfo>, nodeList: Array<CircuitNode
             } else if (wire.getPostCount() > 1) { // 不是地线
                 const p2 = wire.getConnectedPost()!;
                 if (pt.x == p2?.x && pt.y == p2?.y) {
-                    neighbors0.push(ce);
+                    neighbors1.push(ce);
                     if (notReady) {
                         isReady1 = false;
                     }
@@ -271,4 +295,111 @@ function calcWireInfo(wireInfoList: Array<WireInfo>, nodeList: Array<CircuitNode
     }
     return true;
 }
-analyzeCircuit(elmList);
+
+function findUnconnectedNodes(nodeList: Array<CircuitNode>) {
+    const closure: boolean[] = Array(nodeList.length).fill(false);
+    let changed = true;
+    const unconnectedNodes: number[] = [];
+    const nodesWithGroundConnection: Array<CircuitElm> = [];
+    closure[0] = true; // Ground
+
+    while (changed) {
+        changed = false;
+        // 每次循环又一个节点的接地被确定后就可以触发一次额外的循环检查,
+        // 直到所有的node都被确定,或者有节点没有接地
+        for (let i = 0; i < elmList.length; i++) {
+            const ce = elmList[i];
+            if (ce instanceof WireElm)
+                continue;
+            let hasGround = false;
+            for (let j = 0; j < ce.connectionNodeCount; j++) {
+                let hg = ce.hasGroundConnection(j);
+                if (hg)
+                    hasGround = true;
+                if (!closure[ce.getConnectionNode(j)]) { // 当前设置当前端口连接没有接地
+                    if (hg) // 如果当前端口接地了,那么当前设置当前端口连接的节点接地
+                        closure[ce.getConnectionNode(j)] = changed = true;
+                    continue;
+                }
+                // 当前设置当前端口连接已经接地, 找到这个元件的其他(内部)相连接的端口
+                for (let k = 0; k < ce.connectionNodeCount; k++) {
+                    if (j == k) continue;
+                    const kn = ce.getConnectionNode(k);
+                    // 同时该端口相连的节点也没有被标记接地,则设置
+                    if (ce.getConnection(j, k) && !closure[kn]) {
+                        closure[kn] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if (hasGround) // 只添加一次
+                nodesWithGroundConnection.push(ce);
+        }
+    }
+    // verify my changes
+    for (let i = 0; i < nodeList.length; i++) {
+        if (!closure[i] && !nodeList[i].internal) {
+            unconnectedNodes.push(i);
+            // 后面会为这个节点连接上一个巨大电阻
+            console.log("node " + i + " unconnected");
+            closure[i] = true;
+            changed = true;
+            break;
+        }
+    }
+    return {
+        unconnectedNodes,
+        nodesWithGroundConnection
+    };
+}
+// 查找无效/问题回路(如无电阻电压回路)
+function validateCircuit(elmList: Array<CircuitElm>, nodeList: Array<CircuitNode>,
+    nodesWithGroundConnection: Array<CircuitElm>) {
+    for (let i = 0; i < elmList.length; i++) {
+        const ce = elmList[i];
+        // InductorElm
+        // CurrentElm
+        // VCCSElm
+
+        // look for voltage source or wire loops. we do this for voltage sources
+        if (ce.getPostCount() == 2) {
+            if (ce instanceof VoltageElm) {
+                // 
+                let fpi = new FindPathInfo(DetectType.VOLTAGE,
+                    ce, ce.getNode(1), nodeList, nodesWithGroundConnection);
+                if (fpi.findPath(ce.getNode(0))) {
+                    console.error("Voltage source/wire loop with no resistance!", ce);
+                    return false;
+                }
+            }
+        }
+        if (ce instanceof RailElm) { //|| ce instanceof LogicInputElm
+            let fpi = new FindPathInfo(DetectType.VOLTAGE,
+                ce, ce.getNode(0), nodeList, nodesWithGroundConnection);
+            if (fpi.findPath(0)) {
+                console.error("Path to ground with no resistance!", ce);
+                return false;
+            }
+        }
+        // TODO: CapacitorElm
+    }
+    return true;
+}
+
+function stampCircuit() {
+    // 1. 初始化矩阵
+
+    // 2. 调用每个元件的stamp填充矩阵
+
+    // 3. 简化矩阵
+
+    // 4. 线性判断, LU和矩阵校验
+
+    // 5. 特殊元件提取
+}
+function updateCircuit(elmList: Array<CircuitElm>) {
+    analyzeCircuit(elmList);
+    stampCircuit();
+
+}
+updateCircuit(elmList);

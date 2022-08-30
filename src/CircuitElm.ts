@@ -83,15 +83,15 @@ export abstract class CircuitElm {
         this.nodes[port] = idx;
     }
 
-    // setVoltageSource(n: number, v: number) {
-    //     this.voltSource = v;
-    // }
+    setVoltageSource(n: number, v: number) {
+        this.voltSource = v;
+    }
 
     // getVoltageDiff() {
     //     return this.volts[0] - this.volts[1];
     // }
 
-    nonLinear() {
+    get nonLinear() {
         return false;
     }
 
@@ -123,6 +123,17 @@ export abstract class CircuitElm {
     }
 
     hasGroundConnection(n1: number) {
+        return false;
+    }
+
+    get connectionNodeCount() {
+        return this.getPostCount();
+    }
+
+    getConnectionNode(n: number) {
+        return this.getNode(n);
+    }
+    getConnection(n1: number, n2: number): boolean {
         return true;
     }
 }
